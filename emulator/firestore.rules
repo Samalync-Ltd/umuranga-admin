@@ -1,0 +1,220 @@
+rules_version = '2';
+
+// LOCAL EMULATOR ONLY — see emulator/README.md.
+// Derived from umuranga-mobile/firestore.rules. Divergences are marked
+// ADMIN: (dashboard read access) or FIX: (a defect in the mobile rules).
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function owns(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    // ADMIN: the dashboard's entire read surface. Deliberately checks for the
+    // boolean true, not truthiness — a claim set to the string "true" by a
+    // buggy provisioning script must not grant access.
+    function isAdmin() {
+      return signedIn() && request.auth.token.admin == true;
+    }
+
+    function publicProfileIsEligible(uid) {
+      let account = get(/databases/$(database)/documents/users/$(uid));
+      return account.data.profileComplete == true &&
+        account.data.isDeactivated == false;
+    }
+
+    match /users/{uid} {
+      allow read: if owns(uid) || isAdmin(); // ADMIN
+      allow create: if owns(uid) &&
+        request.resource.data.keys().hasOnly([
+          'profileComplete', 'locale', 'isDeactivated', 'createdAt', 'updatedAt'
+        ]) &&
+        request.resource.data.profileComplete is bool &&
+        request.resource.data.isDeactivated is bool &&
+        request.resource.data.createdAt == request.time &&
+        request.resource.data.updatedAt == request.time;
+      // The moderation fields (A1) are absent from this list on purpose: the
+      // owner must never be able to lift their own suspension. Only the Admin
+      // SDK, which bypasses rules entirely, writes them.
+      allow update: if owns(uid) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'profileComplete', 'locale', 'isDeactivated', 'updatedAt'
+        ]) && request.resource.data.updatedAt == request.time;
+      allow delete: if false;
+
+      // NOT opened to isAdmin(): private/settings holds phoneNumber and real
+      // dateOfBirth. Admin reads of those go through a callable that logs the
+      // access — see FIRESTORE_SCHEMA.md, Addition A6.
+      match /private/{document=**} {
+        allow read, write: if owns(uid);
+      }
+    }
+
+    match /profiles/{uid} {
+      // ADMIN: without this branch a suspended profile is invisible to the
+      // moderator who suspended it, because moderationVisibility is 'hidden'.
+      allow read: if owns(uid) || isAdmin() || (
+        signedIn() &&
+        resource.data.visibility == 'visible' &&
+        resource.data.moderationVisibility == 'visible' &&
+        publicProfileIsEligible(uid)
+      );
+      allow create: if owns(uid) &&
+        request.resource.data.moderationVisibility == 'visible';
+      allow update: if owns(uid) &&
+        request.resource.data.moderationVisibility == resource.data.moderationVisibility;
+      allow delete: if false;
+    }
+
+    match /swipes/{uid} {
+      match /given/{targetUid} {
+        allow read, write: if owns(uid);
+      }
+      match /receivedFrom/{fromUid} {
+        allow get, list: if owns(uid);
+        allow create: if signedIn() && fromUid == request.auth.uid;
+        allow update: if false;
+        // FIX: G6 — dismissReceivedLike() deletes this document and the mobile
+        // rule denies it unconditionally, so dismissal always fails.
+        allow delete: if owns(uid);
+      }
+    }
+
+    match /blocks/{uid} {
+      match /blocked/{targetUid} {
+        allow list, write: if owns(uid);
+        allow get: if owns(uid) || (signedIn() && targetUid == request.auth.uid);
+      }
+    }
+
+    match /matches/{matchId} {
+      function likedEachOther(uids) {
+        return
+          exists(/databases/$(database)/documents/swipes/$(uids[0])/given/$(uids[1])) &&
+          get(/databases/$(database)/documents/swipes/$(uids[0])/given/$(uids[1])).data.decision == 'like' &&
+          exists(/databases/$(database)/documents/swipes/$(uids[1])/given/$(uids[0])) &&
+          get(/databases/$(database)/documents/swipes/$(uids[1])/given/$(uids[0])).data.decision == 'like';
+      }
+
+      function repliedIcebreaker(uids) {
+        let forward = uids[0] + '_' + uids[1];
+        let backward = uids[1] + '_' + uids[0];
+        return
+          (exists(/databases/$(database)/documents/icebreakers/$(forward)) &&
+           get(/databases/$(database)/documents/icebreakers/$(forward)).data.status == 'replied') ||
+          (exists(/databases/$(database)/documents/icebreakers/$(backward)) &&
+           get(/databases/$(database)/documents/icebreakers/$(backward)).data.status == 'replied');
+      }
+
+      allow read: if isAdmin() || (signedIn() && request.auth.uid in resource.data.uids); // ADMIN
+      allow create: if signedIn() &&
+        request.auth.uid in request.resource.data.uids &&
+        request.resource.data.uids is list &&
+        request.resource.data.uids.size() == 2 &&
+        matchId == (request.resource.data.uids[0] + '_' + request.resource.data.uids[1]) &&
+        request.resource.data.status == 'active' &&
+        (likedEachOther(request.resource.data.uids) ||
+         repliedIcebreaker(request.resource.data.uids));
+      allow update: if signedIn() &&
+        request.auth.uid in resource.data.uids &&
+        resource.data.status == 'active' &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']) &&
+        request.resource.data.status == 'unmatched';
+      allow delete: if false;
+
+      // FIX: G1 — the mobile rules have no block for these subcollections, so
+      // the root catch-all denies every chat read and write. Rules do not
+      // cascade into subcollections; the match block above does not cover them.
+      function participants() {
+        return get(/databases/$(database)/documents/matches/$(matchId)).data.uids;
+      }
+      function isParticipant() {
+        return signedIn() && request.auth.uid in participants();
+      }
+      function matchIsActive() {
+        return get(/databases/$(database)/documents/matches/$(matchId)).data.status == 'active';
+      }
+
+      match /messages/{messageId} {
+        // ADMIN: report review needs the message that was reported.
+        allow read: if isAdmin() || isParticipant();
+        allow create: if isParticipant() && matchIsActive() &&
+          request.resource.data.senderId == request.auth.uid &&
+          request.resource.data.sentAt == request.time &&
+          request.resource.data.type in ['text', 'image'];
+        // Read receipts only, and only by the recipient — a sender cannot
+        // rewrite the content of a message after it has been delivered.
+        allow update: if isParticipant() &&
+          resource.data.senderId != request.auth.uid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']);
+        allow delete: if false;
+      }
+
+      match /meta/typing {
+        allow read, write: if isParticipant();
+      }
+    }
+
+    match /icebreakers/{icebreakerId} {
+      // ADMIN: a pre-match message is a harassment vector; moderation must see it.
+      allow read: if isAdmin() ||
+        (signedIn() && request.auth.uid in [resource.data.senderId, resource.data.recipientId]);
+      allow create: if signedIn() &&
+        request.auth.uid == request.resource.data.senderId &&
+        icebreakerId == (request.resource.data.senderId + '_' + request.resource.data.recipientId) &&
+        request.resource.data.status == 'pending' &&
+        request.resource.data.message is string &&
+        request.resource.data.message.size() > 0 &&
+        request.resource.data.message.size() <= 200;
+      allow update: if signedIn() &&
+        request.auth.uid == resource.data.recipientId &&
+        resource.data.status == 'pending' &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']) &&
+        request.resource.data.status in ['replied', 'ignored'];
+      allow delete: if false;
+    }
+
+    match /reports/{reportId} {
+      // ADMIN: without this the Phase C queue cannot load a single row.
+      allow read: if isAdmin();
+      allow create: if signedIn() &&
+        request.resource.data.reporterId == request.auth.uid;
+      // Still nobody: resolution is a Cloud Function write via the Admin SDK.
+      allow update, delete: if false;
+    }
+
+    match /entitlements/{uid} {
+      allow read: if owns(uid) || isAdmin(); // ADMIN
+      allow write: if false;
+    }
+
+    // Payments (A3) do not exist in the mobile app at all. Admin-read,
+    // function-write. Blueprint AD05 forbids editing store transactions, so
+    // there is deliberately no write path for anyone but the Admin SDK.
+    match /payments/{paymentId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // Audit log (A4). Admin-readable so the dashboard can show who did what;
+    // never client-writable, or the log could be forged by the thing it audits.
+    match /adminAudit/{entryId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /rewardedAdUsage/{uid} {
+      match /byType/{type} {
+        allow read: if owns(uid) || isAdmin(); // ADMIN: abuse investigation
+        allow write: if owns(uid);
+      }
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

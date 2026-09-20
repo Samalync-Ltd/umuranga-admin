@@ -1,0 +1,44 @@
+rules_version = '2';
+
+// LOCAL EMULATOR ONLY — see emulator/README.md.
+// Derived from umuranga-mobile/storage.rules. Divergence marked ADMIN:.
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function owns(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function isAdmin() {
+      return signedIn() && request.auth.token.admin == true;
+    }
+
+    function profileIsVisible(uid) {
+      let profile = firestore.get(/databases/(default)/documents/profiles/$(uid));
+      let account = firestore.get(/databases/(default)/documents/users/$(uid));
+      return profile.data.visibility == 'visible' &&
+        profile.data.moderationVisibility == 'visible' &&
+        account.data.profileComplete == true &&
+        account.data.isDeactivated == false;
+    }
+
+    match /users/{uid}/profile_photos/{photoId} {
+      // ADMIN (A5): an inappropriatePhotos report is usually filed against a
+      // profile that gets hidden immediately, which makes profileIsVisible()
+      // false — the evidence becomes unreadable at exactly the moment the
+      // moderator needs it.
+      allow read: if owns(uid) || isAdmin() || (signedIn() && profileIsVisible(uid));
+      allow create, update: if owns(uid) &&
+        request.resource.size <= 8 * 1024 * 1024 &&
+        request.resource.contentType.matches('image/.*');
+      allow delete: if owns(uid);
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

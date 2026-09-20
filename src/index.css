@@ -1,0 +1,115 @@
+@import "tailwindcss";
+
+/* ---------------------------------------------------------------------------
+   Umuranga Admin — design tokens
+   Blueprint §11 (admin design direction), §12 (design system), CLAUDE.md.
+
+   The mobile brand palette is reused verbatim. The type scale is NOT: §12's
+   scale (Display 32 … Caption 12) is a mobile scale, and blueprint §11 asks
+   for "the same colors, typography and component logic with a denser desktop
+   layout". So the admin scale is the brand scale shifted down one step for
+   workspace chrome, with the brand sizes kept available for page titles. A
+   16px body in a 12-column data table wastes a laptop screen.
+
+   Colour ratio target (§12): ~70% white, ~20% black/neutral, ~10% red.
+   Red is reserved for primary actions and urgent moderation state. There are
+   deliberately no large red surfaces — `--color-brand-red` never becomes a
+   page or panel background.
+--------------------------------------------------------------------------- */
+
+@theme {
+  /* Brand — identical values to the mobile app's CLAUDE.md */
+  --color-brand-red: #e53935;
+  --color-brand-red-hover: #c62828;
+  --color-brand-red-active: #b71c1c;
+  --color-brand-red-subtle: #fdecea;
+  --color-brand-black: #1f1f1f;
+  --color-brand-gray: #ededed;
+
+  /* Workspace surfaces — white / light-gray, per §11 */
+  --color-surface: #ffffff;
+  --color-surface-sunken: #f7f7f8;
+  --color-surface-raised: #ffffff;
+  --color-border: #e2e2e5;
+  --color-border-strong: #c9c9cf;
+
+  /* Navigation — black sidebar, per §11's first option */
+  --color-nav: #1f1f1f;
+  --color-nav-hover: #2e2e2e;
+  --color-nav-active: #3a3a3a;
+  --color-nav-fg: #f5f5f5;
+  --color-nav-fg-muted: #9a9a9e;
+
+  /* Text */
+  --color-fg: #1f1f1f;
+  --color-fg-muted: #5f5f66;
+  --color-fg-subtle: #8a8a92;
+  --color-fg-inverse: #ffffff;
+
+  /* Status — moderation chips. Red is urgent only. */
+  --color-status-neutral: #5f5f66;
+  --color-status-neutral-bg: #f0f0f2;
+  --color-status-ok: #1b7f4d;
+  --color-status-ok-bg: #e6f4ec;
+  --color-status-warn: #9a6400;
+  --color-status-warn-bg: #fdf3e2;
+  --color-status-urgent: #b71c1c;
+  --color-status-urgent-bg: #fdecea;
+  --color-status-info: #1b5e9a;
+  --color-status-info-bg: #e8f1fa;
+
+  /* Type — Poppins, per CLAUDE.md */
+  --font-sans: "Poppins", "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+
+  /* Admin scale (dense). Brand scale kept for page titles only. */
+  --text-page: 1.375rem;      /* 22px — brand H2, the largest thing on screen */
+  --text-page--line-height: 1.75rem;
+  --text-section: 1rem;       /* 16px — brand Body, used as a heading here */
+  --text-section--line-height: 1.5rem;
+  --text-body: 0.875rem;      /* 14px — brand Small, the workspace default */
+  --text-body--line-height: 1.25rem;
+  --text-meta: 0.8125rem;     /* 13px — table cells, secondary metadata */
+  --text-meta--line-height: 1.125rem;
+  --text-caption: 0.75rem;    /* 12px — brand Caption, chips and timestamps */
+  --text-caption--line-height: 1rem;
+
+  /* Motion — 180–280ms, restrained (CLAUDE.md) */
+  --ease-standard: cubic-bezier(0.2, 0, 0.2, 1);
+
+  /* Dense layout metrics */
+  --spacing-row: 0.5rem;
+  --sidebar-width: 14rem;
+  --topbar-height: 3.25rem;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: var(--color-surface-sunken);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  font-size: var(--text-body);
+  line-height: var(--text-body--line-height);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* This is an internal tool used with a keyboard. Focus is always visible. */
+:focus-visible {
+  outline: 2px solid var(--color-brand-red);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
