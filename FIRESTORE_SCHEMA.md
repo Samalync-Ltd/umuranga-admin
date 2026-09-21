@@ -40,7 +40,7 @@ Written by `ProfileFirestoreService.saveProfile` and `AccountFirestoreService`.
 
 | Field | Type | Notes |
 |---|---|---|
-| `profileComplete` | `bool` | Drives `publicProfileIsEligible()` in rules and Discovery visibility. |
+| `profileComplete` | `bool` | Folded into `profiles/{uid}.discoverable` at write time. No longer read by any rule: see §3. |
 | `locale` | `string \| null` | First entry of `profile.languages`. `null` when the user picked no language. |
 | `isDeactivated` | `bool` | **User-controlled self-deactivation.** Not a moderation lever — see [Gap G4](#g4--there-is-no-admin-suspensionban-field-at-all). |
 | `createdAt` | `ts` | Rules pin this to `request.time` on create. |
@@ -113,6 +113,7 @@ shaped by `ProfileFirestoreMapper.publicData`.
 | `photos` | `map[]` | See below. |
 | `visibility` | `string` | `hidden` \| `visible`. **User-controlled.** |
 | `moderationVisibility` | `string` | `visible` \| `hidden`. **Admin/moderation-controlled — see below.** |
+| `discoverable` | `bool` | **The only field Discovery's candidate query filters on, and the field the read rule keys off.** Denormalized: `profileComplete && !isDeactivated && visibility == 'visible' && moderationVisibility == 'visible'`. Written by `ProfileFirestoreService.saveProfile` and by `AccountFirestoreService.setDeactivated`; constrained by the write rule (see below). |
 | `createdAt` | `ts` | |
 | `updatedAt` | `ts` | Also the Discovery pagination sort key. |
 
@@ -126,15 +127,35 @@ shaped by `ProfileFirestoreMapper.publicData`.
 | `sortOrder` | `int` |
 | `isPrimary` | `bool` |
 
-**Read:** owner, or any signed-in user when `visibility == 'visible'` **and**
-`moderationVisibility == 'visible'` **and** `publicProfileIsEligible(uid)`
-(`profileComplete == true && isDeactivated == false`).
+**Read:** owner, admin, or any signed-in user when `discoverable == true` **and**
+`moderationVisibility == 'visible'`.
+
+This replaced a clause that called `publicProfileIsEligible(uid)`, which did a `get()`
+on `users/{uid}`. **A rule that reads another document can never authorize a `list`:**
+during query evaluation the path wildcard is unbound, so the `get()` returns null and
+every candidate query failed with permission-denied. Both surviving clauses are
+self-contained, and because *rules are not filters*, the candidate query must repeat
+both as `where()` filters — see `DiscoveryFirestoreService.fetchCandidates`.
 
 **Write:** owner only, and the rules **forbid the owner from ever changing
 `moderationVisibility`** (create must be `'visible'`; update must leave it unchanged).
 That is deliberate and correct: `moderationVisibility` is the profile-hiding moderation lever,
-writable *only* by a Cloud Function via the Admin SDK. The trust model the brief describes is
-already half-built here.
+writable *only* by a Cloud Function via the Admin SDK.
+
+`discoverable`, by contrast, *is* client-written, so the write rule constrains what it may
+say (`discoverableIsHonest()`): setting it to `true` requires `moderationVisibility == 'visible'`,
+`visibility == 'visible'`, and the required public fields to be present and well-formed
+(name ≥ 2 chars, `displayAge` ≥ 18, a valid `gender`/`interestedIn`, ≥ 2 photos). Without
+that constraint a moderation-hidden or suspended user could put themselves back in the deck
+by writing one boolean — the same client-trusted-field hole as [Gap G4](#g4). The check runs
+on create *and* update, and because `request.resource.data` is the merged post-state, a
+partial merge cannot slip past it either.
+
+**Obligation on moderation:** `adminSuspendUser` / ban must set
+`profiles/{uid}.discoverable = false` in the same batch as
+`moderationVisibility = 'hidden'`. The read rule checks both, so a stale `discoverable`
+alone cannot expose a hidden profile — but leaving it true would still be a bug, and the
+candidate query filters on `discoverable` first.
 
 ## 4. `swipes/{uid}/given/{targetUid}` — a user's own like/pass decisions
 
@@ -309,7 +330,8 @@ from the owner's `update` `hasOnly` list (which currently allows only
 `profileComplete, locale, isDeactivated, updatedAt` — so they are already excluded by
 construction; this must stay true when the list is edited).
 
-Suspend/ban must **also** set `profiles/{uid}.moderationVisibility = 'hidden'` in the same
+Suspend/ban must **also** set `profiles/{uid}.moderationVisibility = 'hidden'` and
+`profiles/{uid}.discoverable = false` in the same
 Function, since that is what actually removes the profile from Discovery.
 
 ## A2. `reports/{reportId}` — moderation fields
@@ -423,7 +445,7 @@ Every privileged write. All callable (`onCall`), all guarded by
 
 | Callable | Writes | Phase |
 |---|---|---|
-| `adminSuspendUser` | `users/{uid}` moderation fields, `profiles/{uid}.moderationVisibility` | B |
+| `adminSuspendUser` | `users/{uid}` moderation fields, `profiles/{uid}.moderationVisibility`, `profiles/{uid}.discoverable` | B |
 | `adminBanUser` | as above + Auth `disabled: true` | B |
 | `adminReinstateUser` | reverts both | B |
 | `adminResolveReport` | `reports/{id}` resolution fields | C |
@@ -549,7 +571,7 @@ match /meta/typing {
 `firestore.rules` has no `isAdmin()` function and no admin branch anywhere. Concretely:
 
 - `reports` — `allow read: if false`. **The Phase C queue cannot load.**
-- `profiles/{uid}` — readable only when `visibility == 'visible' && moderationVisibility == 'visible'`. **A suspended or hidden profile becomes invisible to the moderator who suspended it.**
+- `profiles/{uid}` — readable only when `discoverable == true && moderationVisibility == 'visible'`. **A suspended or hidden profile becomes invisible to the moderator who suspended it.**
 - `users/{uid}` — owner-only. **The Phase B user list cannot load.**
 - `entitlements/{uid}` — owner-only. **Phase D cannot load.**
 

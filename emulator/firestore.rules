@@ -20,10 +20,35 @@ service cloud.firestore {
       return signedIn() && request.auth.token.admin == true;
     }
 
-    function publicProfileIsEligible(uid) {
-      let account = get(/databases/$(database)/documents/users/$(uid));
-      return account.data.profileComplete == true &&
-        account.data.isDeactivated == false;
+    // Everything Discovery needs about a candidate, denormalized onto the
+    // profile document. It replaced a get() on users/{uid}: a rule that reads
+    // another document can never authorize a `list`, because the path wildcard
+    // is unbound during query evaluation. Rules are not filters, so the
+    // candidate query repeats these clauses as where() filters.
+    //
+    // The owner writes `discoverable`, so the update rule pins what it may
+    // say. Suspend/ban must set it to false alongside moderationVisibility
+    // (Addition A1) — the read rule checks both, so a stale value alone still
+    // cannot expose a hidden profile.
+    function discoverableIsHonest() {
+      return request.resource.data.discoverable is bool && (
+        request.resource.data.discoverable == false || (
+          request.resource.data.moderationVisibility == 'visible' &&
+          request.resource.data.visibility == 'visible' &&
+          request.resource.data.keys().hasAll([
+            'firstName', 'displayAge', 'gender', 'interestedIn',
+            'relationshipIntention', 'country', 'city', 'bio', 'photos'
+          ]) &&
+          request.resource.data.firstName is string &&
+          request.resource.data.firstName.size() >= 2 &&
+          request.resource.data.displayAge is int &&
+          request.resource.data.displayAge >= 18 &&
+          request.resource.data.gender in ['woman', 'man'] &&
+          request.resource.data.interestedIn in ['women', 'men'] &&
+          request.resource.data.photos is list &&
+          request.resource.data.photos.size() >= 2
+        )
+      );
     }
 
     match /users/{uid} {
@@ -58,14 +83,15 @@ service cloud.firestore {
       // moderator who suspended it, because moderationVisibility is 'hidden'.
       allow read: if owns(uid) || isAdmin() || (
         signedIn() &&
-        resource.data.visibility == 'visible' &&
-        resource.data.moderationVisibility == 'visible' &&
-        publicProfileIsEligible(uid)
+        resource.data.discoverable == true &&
+        resource.data.moderationVisibility == 'visible'
       );
       allow create: if owns(uid) &&
-        request.resource.data.moderationVisibility == 'visible';
+        request.resource.data.moderationVisibility == 'visible' &&
+        discoverableIsHonest();
       allow update: if owns(uid) &&
-        request.resource.data.moderationVisibility == resource.data.moderationVisibility;
+        request.resource.data.moderationVisibility == resource.data.moderationVisibility &&
+        discoverableIsHonest();
       allow delete: if false;
     }
 
