@@ -17,7 +17,13 @@ service cloud.firestore {
     // boolean true, not truthiness — a claim set to the string "true" by a
     // buggy provisioning script must not grant access.
     function isAdmin() {
-      return signedIn() && request.auth.token.admin == true;
+      // FIX: `.get('admin', false)`, not `.admin`. Reading a claim that is
+      // simply absent — which it is for every non-admin — raises "Property
+      // admin is undefined on object" rather than evaluating false, and an
+      // erroring clause denies the whole request. Because this is the FIRST
+      // branch of the matches read rule, it broke the ordinary "my matches"
+      // query for every ordinary user.
+      return signedIn() && request.auth.token.get('admin', false) == true;
     }
 
     // Everything Discovery needs about a candidate, denormalized onto the
@@ -73,8 +79,21 @@ service cloud.firestore {
       // NOT opened to isAdmin(): private/settings holds phoneNumber and real
       // dateOfBirth. Admin reads of those go through a callable that logs the
       // access — see FIRESTORE_SCHEMA.md, Addition A6.
-      match /private/{document=**} {
-        allow read, write: if owns(uid);
+      match /private/{docId} {
+        allow read: if owns(uid);
+        // discoveryUsage is the enforced daily-like counter. An owner-writable
+        // counter is not a limit, it is a suggestion — only the recordLike
+        // Cloud Function (Admin SDK, which bypasses rules) advances it.
+        allow write: if owns(uid) && docId != 'discoveryUsage';
+
+        // A `**` wildcard also matches ZERO segments, so this block covers
+        // users/{uid}/private/discoveryUsage itself as well as anything
+        // beneath it. The guard has to be repeated or the deny above is
+        // worthless.
+        match /{nested=**} {
+          allow read: if owns(uid);
+          allow write: if owns(uid) && docId != 'discoveryUsage';
+        }
       }
     }
 
@@ -97,15 +116,23 @@ service cloud.firestore {
 
     match /swipes/{uid} {
       match /given/{targetUid} {
-        allow read, write: if owns(uid);
+        allow read: if owns(uid);
+        // Passes only. A LIKE spends the daily allowance and can complete a
+        // match, so it is written solely by the recordLike callable — a
+        // client-writable like is exactly how the limit was bypassable.
+        allow create, update: if owns(uid) &&
+          request.resource.data.decision == 'pass';
+        // Deleting your own pass IS a rewind, and rewind is Premium.
+        allow delete: if false;
       }
+
+      // The likes inbox is server-only in both directions. Its document ids
+      // ARE the likers' uids, and profiles/{uid} is readable by any signed-in
+      // user — so a readable inbox would hand a free viewer every liker's
+      // photos whatever the UI drew. getReceivedLikes returns name and age
+      // and withholds the rest.
       match /receivedFrom/{fromUid} {
-        allow get, list: if owns(uid);
-        allow create: if signedIn() && fromUid == request.auth.uid;
-        allow update: if false;
-        // FIX: G6 — dismissReceivedLike() deletes this document and the mobile
-        // rule denies it unconditionally, so dismissal always fails.
-        allow delete: if owns(uid);
+        allow read, write: if false;
       }
     }
 
@@ -116,39 +143,21 @@ service cloud.firestore {
       }
     }
 
+    // A match is created by the recordLike callable and by nothing else.
+    // The old client create was guarded by likedEachOther() /
+    // repliedIcebreaker(), which read the swipe documents to prove the claim.
+    // Honest as far as it went, but the check and the write were separate
+    // operations, so two simultaneous likes could both pass and race — and a
+    // rule cannot enforce the daily like limit that gates a like at all. The
+    // callable does the read, the limit check and the write in one
+    // transaction on a deterministic id.
     match /matches/{matchId} {
-      function likedEachOther(uids) {
-        return
-          exists(/databases/$(database)/documents/swipes/$(uids[0])/given/$(uids[1])) &&
-          get(/databases/$(database)/documents/swipes/$(uids[0])/given/$(uids[1])).data.decision == 'like' &&
-          exists(/databases/$(database)/documents/swipes/$(uids[1])/given/$(uids[0])) &&
-          get(/databases/$(database)/documents/swipes/$(uids[1])/given/$(uids[0])).data.decision == 'like';
-      }
-
-      function repliedIcebreaker(uids) {
-        let forward = uids[0] + '_' + uids[1];
-        let backward = uids[1] + '_' + uids[0];
-        return
-          (exists(/databases/$(database)/documents/icebreakers/$(forward)) &&
-           get(/databases/$(database)/documents/icebreakers/$(forward)).data.status == 'replied') ||
-          (exists(/databases/$(database)/documents/icebreakers/$(backward)) &&
-           get(/databases/$(database)/documents/icebreakers/$(backward)).data.status == 'replied');
-      }
-
       allow read: if isAdmin() || (signedIn() && request.auth.uid in resource.data.uids); // ADMIN
-      allow create: if signedIn() &&
-        request.auth.uid in request.resource.data.uids &&
-        request.resource.data.uids is list &&
-        request.resource.data.uids.size() == 2 &&
-        matchId == (request.resource.data.uids[0] + '_' + request.resource.data.uids[1]) &&
-        request.resource.data.status == 'active' &&
-        (likedEachOther(request.resource.data.uids) ||
-         repliedIcebreaker(request.resource.data.uids));
-      allow update: if signedIn() &&
-        request.auth.uid in resource.data.uids &&
-        resource.data.status == 'active' &&
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']) &&
-        request.resource.data.status == 'unmatched';
+      allow create: if false;
+      // Unmatch goes through the unmatchUser callable: it deletes the
+      // mirrored inbox entries on both sides, which neither participant may
+      // touch.
+      allow update: if false;
       allow delete: if false;
 
       // FIX: G1 — the mobile rules have no block for these subcollections, so

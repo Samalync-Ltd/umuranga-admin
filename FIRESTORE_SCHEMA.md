@@ -70,6 +70,12 @@ Rules: `allow read, write: if owns(uid)` on the whole subtree. Four distinct doc
 | `likeDate` | `daykey` | |
 | `likesGivenToday` | `int` | Reset implicitly when `likeDate` ≠ today. |
 
+**Server-owned since Phase 4.** The rules deny the owner writing this document — an
+owner-writable counter is not a limit, it is a suggestion. Only the `recordLike` Cloud Function
+advances it. Note the deny has to be repeated on the nested `{nested=**}` match as well: a `**`
+wildcard matches **zero** segments too, so a recursive block under `private/{docId}` also covers
+`discoveryUsage` itself and silently re-granted the write.
+
 ### 2c. `users/{uid}/private/discoveryBonusUsage`
 
 | Field | Type | Notes |
@@ -165,17 +171,38 @@ candidate query filters on `discoverable` first.
 | `createdAt` | `ts` | |
 
 Doc ID is the target's uid, so "have I already decided on this person" is an existence check.
-**Read/write:** owner only.
+
+**Read:** owner only. **Write:** owner, **but only `decision == 'pass'`.**
+
+A pass grants nothing, costs nothing and is confined to its own owner's document, so the worst a
+forged one can do is hide someone from yourself. A **like** is the opposite — it spends the daily
+allowance and can complete a match — so it is written solely by the `recordLike` Cloud Function.
+A client-writable like is precisely how the daily limit used to be bypassable.
+
+**Delete: nobody.** Deleting your own pass *is* a rewind, and rewind is Premium, so it goes
+through the `rewindLastPass` callable which checks entitlement.
+
+Needs a composite index (`decision` ASC, `createdAt` DESC, collection scope) for the
+"most recent pass" query `rewindLastPass` runs.
 
 ## 5. `swipes/{uid}/receivedFrom/{fromUid}` — mirrored inbox ("who liked me")
 
-Same field shape as `given`. Written by `DiscoveryFirestoreService.recordDecision`, which
-batches both sides in one commit.
+Same field shape as `given`. Written by the `recordLike` Cloud Function, in the same transaction
+as the swipe itself, so an inbox entry always corresponds to a real, counted like.
 
-**Read:** owner (`get` and `list`). **Create:** any signed-in user, where `fromUid` must equal
-their own uid. **Update/delete: nobody** — which means `dismissReceivedLike()`
-(`matching_firestore_service.dart`) calls `.delete()` on a path the rules unconditionally deny.
-See [Gap G6](#g6--dismissreceivedlike-deletes-a-document-the-rules-forbid-deleting).
+**Read and write: nobody.** Closed to clients in both directions since Phase 4.
+
+*Not writable* for the reason above. *Not readable* because the document IDs here **are the
+likers' uids**, and `profiles/{uid}` is readable by any signed-in user — so handing a free viewer
+this list would hand them every liker's photos too, whatever the UI chose to draw. The free tier
+is sold on seeing a name and an age but not the photo; that promise only means anything if this
+collection is closed. `getReceivedLikes` returns name and age, withholds the rest, and withholds
+the uid as well.
+
+Acting on an entry without knowing who it is: `getReceivedLikes` returns an opaque per-viewer
+`token` (a truncated SHA-256 of `viewerUid:likerId`), and `dismissReceivedLike` takes that token
+and resolves it by recomputing it over the viewer's own inbox. Stateless — nothing to store or
+expire — and a token for someone not actually in that inbox resolves to nothing.
 
 ## 6. `blocks/{uid}/blocked/{targetUid}`
 
@@ -197,12 +224,24 @@ ID is their own uid (so Discovery can ask "did this person block me" without enu
 | `status` | `string` | `active` \| `unmatched`. Unmatch is a soft delete. |
 | `createdAt` | `ts` | |
 
-**Read:** either participant. **Create:** a participant, but only when the rules independently
-verify *either* `likedEachOther(uids)` (both `swipes/*/given/*` docs exist with
-`decision == 'like'`) *or* `repliedIcebreaker(uids)`. This is the one place the mobile app
-achieves trustworthy privileged state without a Cloud Function — verified server-side in rules,
-not asserted by the client. **Update:** either participant, `active → unmatched` only, `status`
-being the only key allowed to change. **Delete:** nobody.
+| `unmatchedAt` | `ts` | Set by `unmatchUser`. |
+| `unmatchedBy` | `string` | uid of whoever unmatched. |
+
+**Read:** either participant, or admin. **Create, update, delete: nobody.**
+
+Created solely by the `recordLike` Cloud Function. This used to be a client create guarded by
+`likedEachOther(uids)` / `repliedIcebreaker(uids)` — rule-side checks that read the swipe
+documents to prove the claim rather than trusting the client. That was honest as far as it went,
+but it could not be complete: the check and the write were two separate operations, so two
+simultaneous likes could both pass the check and race, and **a rule cannot enforce the daily like
+limit that gates a like in the first place**. The callable does the read, the limit check and the
+write in one transaction on the deterministic sorted-uid ID, which is what makes "exactly one
+match" a property of the data model rather than of timing.
+
+Unmatch goes through the `unmatchUser` callable for a similar reason: it soft-deletes the match
+*and* deletes the mirrored inbox entries on both sides, and neither participant may touch the
+other's. The `uids`/`createdAt` history stays intact for abuse review, and the swipe records stay,
+so neither person resurfaces in the other's deck. "Unmatch" is not "forget".
 
 ## 8. `matches/{matchId}/messages/{messageId}` — chat
 
@@ -423,7 +462,8 @@ a wildcard read does not.
 
 ## A7. Composite indexes the dashboard will need
 
-`firestore.indexes.json` currently has exactly one index (the Discovery query). Add:
+`firestore.indexes.json` now holds three (the Discovery candidate query, the matches query, and
+`given`/`decision`+`createdAt` for rewind). Add:
 
 | Collection | Fields |
 |---|---|
@@ -439,6 +479,38 @@ See also [Gap G5](#g5--a-missing-index-the-mobile-app-already-needs), an index t
 ---
 
 # Part 3 — Cloud Function surface
+
+## Deployment ownership — read this before deploying
+
+**Both repos deploy functions to `umuranga-4116e`**, and `firebase deploy --only functions`
+treats the deploying source as the whole truth: without a guard it deletes every function it does
+not find locally. Each repo therefore sets its own `codebase` in `firebase.json`, which scopes
+that comparison so neither can sweep the other away:
+
+| Repo | `codebase` | Functions |
+|---|---|---|
+| `umuranga-mobile` | `mobile` | `recordLike`, `getLikeLimitStatus`, `getReceivedLikes`, `dismissReceivedLike`, `unmatchUser`, `rewindLastPass` |
+| `umuranga-admin` | `admin` | the admin callables below |
+
+**The dashboard repo must set `"codebase": "admin"` before its first functions deploy.** A
+codebase-less deploy from either side deletes the other's functions.
+
+All functions are **2nd gen, region `africa-south1`** — the same region as Firestore, and the
+only generation that region supports. Callables are addressed per region, so a client resolving
+one from the default region gets a 404.
+
+## Mobile callables (shipped, Phase 4)
+
+| Callable | Writes | Why it cannot be a rule |
+|---|---|---|
+| `recordLike` | `swipes/{uid}/given/*`, `swipes/{target}/receivedFrom/*`, `users/{uid}/private/discoveryUsage`, `matches/*` | The daily limit, the mirror and match creation must be one transaction; a rule cannot count, and check-then-write races. |
+| `getLikeLimitStatus` | — | Reads the now server-owned counter plus entitlement. |
+| `getReceivedLikes` | — | Withholds the photo *and* the liker's uid from free viewers; the inbox is closed to clients. |
+| `dismissReceivedLike` | deletes the inbox entry, records a pass | Same closure; addressed by opaque token. |
+| `unmatchUser` | `matches/*`, both `receivedFrom` entries | Reaches both sides; neither participant may touch the other's. |
+| `rewindLastPass` | deletes `given` + mirrored entry | Deleting the recipient's mirror is not the swiper's to do; also enforces Premium. |
+
+## Admin callables (planned)
 
 Every privileged write. All callable (`onCall`), all guarded by
 `context.auth.token.admin === true`, all writing an `adminAudit` entry.
@@ -611,15 +683,16 @@ An `array-contains` combined with an equality filter requires a composite index.
 `firestore.indexes.json` contains only the `profiles` index. **This query will fail at runtime
 against a real project.** Add: `matches` — `uids` ARRAY_CONTAINS, `status` ASC.
 
-## G6 — `dismissReceivedLike` deletes a document the rules forbid deleting
+## G6 — `dismissReceivedLike` deletes a document the rules forbid deleting — RESOLVED (Phase 4)
 
-`matching_firestore_service.dart` calls `_receivedFrom(uid).doc(likerId).delete()`. The rule for
-`swipes/{uid}/receivedFrom/{fromUid}` is `allow update, delete: if false` — unconditional, with
-no owner exception. The call always fails.
+`matching_firestore_service.dart` called `_receivedFrom(uid).doc(likerId).delete()` against a
+rule of `allow update, delete: if false`, so the call always failed.
 
-Either the rule should allow the owner to delete their own inbox entry, or dismissal should be a
-soft flag. The rule's own comment does not explain the omission, which suggests it is an
-oversight rather than a decision. **Recommend: allow owner delete.**
+Resolved the *other* way from the original recommendation. Opening owner delete would also have
+required leaving the inbox readable, and its document IDs are the likers' uids — which would have
+handed every free viewer the photos the free tier exists to withhold. The inbox is now closed to
+clients entirely and `dismissReceivedLike` is a Cloud Function, addressed by opaque token. See
+§5.
 
 ## G7 — Rewarded-ad claim IDs are generated but never stored
 
